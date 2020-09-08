@@ -1,0 +1,160 @@
+#Define a Default Image which would be used for all the stages
+default:
+  image: jfgarcia268/sfdx_vlocity_java:latest
+#
+# Define the stages of our pipeline
+#
+stages:
+    - validate_deploy
+    - deploy
+    - vlocity_deploy
+    - Create_scratch_org
+
+variables:
+     scratch_org: "false"
+
+#Job stages
+CI_Deploy:
+    stage: deploy
+    image: 92sgupta/vlocity_sfdx_tools:latest
+    only:
+      refs:
+           - dev
+      variables:
+           - '$scratch_org == "false"'
+    artifacts:
+        paths:
+            - pmdresults*
+    script: 
+        - echo ${SFDX_URL_CI} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -s -a CI -f env.sfdx
+        - rm -rf env.sfdx
+        - sfdx vlocityestools:sfsource:createdeltapackage -u CI -p cmt -d salesforce_sfdx
+        - |
+          if [ -d "salesforce_sfdx_delta" ]; then
+             if [ -d salesforce_sfdx_delta/main/default/classes ]; then
+                echo " Checking the PMD now"
+                pmd_result=pmdresults_`date +%d%m%Y%H%M`.csv
+                rm -rf pmdresults*
+                /PMD/bin/run.sh pmd -no-cache -d "./salesforce_sfdx_delta/main/default/classes" -R "/PMD/Rules/quickstart.xml" -f csv > $pmd_result || true
+             fi 
+             sfdx force:source:deploy --sourcepath salesforce_sfdx_delta --targetusername CI --verbose
+          else 
+                echo "No SF changes found"
+          fi
+        - echo "Deploying the Vlocity components"
+        - vlocity -sfdx.username CI -job Deploy_Delta.yaml packDeploy --verbose true --simpleLogging true
+
+SIT_Deploy:
+    stage: deploy
+    only:
+      refs:
+           - release/*
+      variables:
+           - '$scratch_org == "false"'
+    script: 
+        - echo ${SFDX_URL_SIT} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -s -a SIT -f env.sfdx
+        - rm -rf env.sfdx
+        - sfdx vlocityestools:sfsource:createdeltapackage -u SIT -p cmt -d salesforce_sfdx
+        - |
+          if [ -d "salesforce_sfdx_delta" ]; then
+              sfdx force:source:deploy --sourcepath salesforce_sfdx_delta --targetusername CI --verbose
+          else 
+              echo "No SF changes found"
+          fi        
+        - echo "Deploying the Vlocity components"
+        - vlocity -sfdx.username SIT -job Deploy_Delta.yaml packDeploy --verbose true --simpleLogging true
+    allow_failure: false
+    
+PROD_Validate:
+    stage: validate_deploy
+    only:
+      refs:
+           - master
+      variables:
+           - '$scratch_org == "false"'
+    when: manual
+    script:
+        - echo ${SFDX_URL_PROD} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -s -a PROD -f env.sfdx
+        - rm -rf env.sfdx
+        - sfdx vlocityestools:sfsource:createdeltapackage -u PROD -p cmt -d salesforce_sfdx
+        - |
+          if [ -d "salesforce_sfdx_delta" ]; then 
+             sfdx force:source:deploy --sourcepath salesforce_sfdx_delta --targetusername PROD  --checkonly --testlevel RunLocalTests --wait 100
+             sfdx force:source:deploy:report -u PROD | perl -lne 'print $1 if /Job.ID.{3}(\w+)/' > Quick_Deploy_ID.txt
+          else 
+              echo " No SF changes found"
+          fi
+    artifacts:
+        paths:
+            - Quick_Deploy_ID.txt
+    allow_failure: false
+
+PROD_SF_Deploy:
+    stage: deploy
+    only:
+      refs:
+           - master
+      variables:
+           - '$scratch_org == "false"'
+    when: manual
+    script:
+        - echo ${SFDX_URL_PROD} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -d -a PROD -f env.sfdx
+        - rm -rf env.sfdx
+        # Do the quick Deploy now
+        - job_id=$(cat Quick_Deploy_ID.txt)
+        - echo $job_id
+        - sfdx force:source:deploy -q $job_id  -w 100
+    needs:
+      - job: PROD_Validate
+        artifacts: true
+    allow_failure: false
+
+Vlocity_deploy:
+    stage: vlocity_deploy
+    only:
+      refs:
+           - master
+      variables:
+           - '$scratch_org == "false"'
+    when: manual
+    script: 
+        - echo "Deploying the Vlocity components"
+        - vlocity -sfdx.username SIT -job Deploy_Delta.yaml packDeploy --verbose true --simpleLogging true
+    needs:
+      - job:  PROD_SF_Deploy
+        artifacts: false
+
+
+Scratch_org:
+    stage: Create_scratch_org
+    rules:
+       - if: '$scratch_org == "true"'
+    script:
+        # Login
+        - echo ${SFDX_URL_DEVHUB} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -d -a DEVHUB -f env.sfdx
+        - rm -rf env.sfdx
+        # Create scratch org
+        - sfdx force:org:create --setdefaultusername --definitionfile config/project-scratch-def.json --wait 10 --durationdays 7 -u DEVHUB
+        - sfdx force:source:push
+        # Install Manage Package
+        - PACKAGE_ID=$(jq -r '.packageAliases."Vlocity CMT"' sfdx-project.json)
+        - sfdx force:package:install -p ${PACKAGE_ID} -w 1000 --noprompt
+        # Vlocity Setup 
+        - vlocity  --nojob packUpdateSettings --simpleLogging true
+        - vlocity  --nojob installVlocityInitial --verbose
+        - vlocity --nojob runApex -apex apex/cmt_InitializeOrg.cls --simpleLogging true
+        # Vlocity Deploy
+        - vlocity  packDeploy -job Deploy_Delta.yaml  --verbose true --simpleLogging true
+        - vlocity --nojob runApex -apex apex/RunProductBatchJobs.cls --simpleLogging true
+        # Get the username for the scratch org
+        - export SCRATCH_ORG_USERNAME="$(sfdx force:user:display --json | jq -r '.result.username')"
+        # Generate a new password for the scrach org
+        - sfdx force:user:password:generate
+        - echo -e "\n\n\n\n"
+        # Display username, password, and instance URL for login
+        - sfdx force:user:display
