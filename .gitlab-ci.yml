@@ -16,7 +16,6 @@ variables:
 #Job stages
 CI_Deploy:
     stage: deploy
-    image: 92sgupta/vlocity_sfdx_tools:latest
     only:
       refs:
            - dev
